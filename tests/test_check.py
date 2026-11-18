@@ -30,12 +30,13 @@ from typing import override
 
 from android_page_align.check import (
     PAGE_16K,
+    PT_GNU_RELRO,
     PT_LOAD,
     Finding,
     artifact_findings,
-    elf_finding,
-    load_segment_alignments,
+    elf_findings,
     main,
+    program_headers,
     zip_data_offset,
 )
 
@@ -52,16 +53,21 @@ _EHDR32 = "16sHHIIIIIHHHHHH"
 _PHDR32 = "IIIIIIII"
 
 
+# One program header: `(p_type, p_align)`, or `(p_type, p_align, p_vaddr,
+# p_memsz)` where the test reads where a segment sits.
+Segment = tuple[int, int] | tuple[int, int, int, int]
+
+
 def elf(
     bits: int = 64,
     endian: str = "<",
-    segments: tuple[tuple[int, int], ...] = ((PT_LOAD, 0x4000), (PT_LOAD, 0x4000)),
+    segments: tuple[Segment, ...] = ((PT_LOAD, 0x4000), (PT_LOAD, 0x4000)),
     phentsize: int | None = None,
 ) -> bytes:
     """A shared object's ELF header and program header table.
 
-    `segments` is `(p_type, p_align)` per program header. The table follows the
-    header directly, as a linker places it.
+    A segment given without a place sits at address 0 with 0x1000 bytes in
+    memory. The table follows the header directly, as a linker places it.
     """
     ehdr, phdr = (_EHDR64, _PHDR64) if bits == 64 else (_EHDR32, _PHDR32)
     ehsize = struct.calcsize(ehdr)
@@ -86,19 +92,40 @@ def elf(
         0,
     )
     table = b""
-    for p_type, p_align in segments:
+    for segment in segments:
+        p_type, p_align = segment[0], segment[1]
+        vaddr, memsz = (segment[2], segment[3]) if len(segment) == 4 else (0, 0x1000)
+        # p_paddr and p_filesz sit beside p_vaddr and p_memsz, so they get
+        # values of their own: equal ones would let a parser reading the
+        # neighbouring field pass.
+        paddr, filesz = 0, memsz // 2
         if bits == 64:
             entry = struct.pack(
-                endian + phdr, p_type, 5, 0, 0, 0, 0x1000, 0x1000, p_align
+                endian + phdr, p_type, 5, 0, vaddr, paddr, filesz, memsz, p_align
             )
         else:
             entry = struct.pack(
-                endian + phdr, p_type, 0, 0, 0, 0x1000, 0x1000, 5, p_align
+                endian + phdr, p_type, 0, vaddr, paddr, filesz, memsz, 5, p_align
             )
         # Written at the declared stride, so a short one truncates each entry
         # the way a corrupt table would present it.
         table += (entry + b"\0" * entsize)[:entsize]
     return header + table
+
+
+def load_alignments(data: bytes) -> tuple[int, list[int]]:
+    bits, segments = program_headers(data)
+    return bits, [s.align for s in segments if s.p_type == PT_LOAD]
+
+
+def only_reason(data: bytes) -> str | None:
+    """The reason of the one finding for `data`, or None; a test that expects
+    one finding fails if there are two."""
+    found = elf_findings("lib.so", data)
+    if not found:
+        return None
+    assert len(found) == 1, found
+    return found[0].reason
 
 
 def write_archive(path: Path, entries: list[tuple[str, bytes, int]]) -> Path:
@@ -144,7 +171,7 @@ class TestLoadSegmentAlignments(unittest.TestCase):
     def test_a_64_bit_library_reads_its_class_and_each_load_alignment(self) -> None:
         segments = ((PT_LOAD, 0x4000), (PT_DYNAMIC, 8), (PT_LOAD, 0x10000))
         self.assertEqual(
-            load_segment_alignments(elf(segments=segments)), (64, [0x4000, 0x10000])
+            load_alignments(elf(segments=segments)), (64, [0x4000, 0x10000])
         )
 
     def test_a_32_bit_library_reads_as_32_bit(self) -> None:
@@ -152,7 +179,7 @@ class TestLoadSegmentAlignments(unittest.TestCase):
         # e_phoff and the program header fields at other offsets, so a parser
         # that ignored EI_CLASS would read garbage here.
         self.assertEqual(
-            load_segment_alignments(elf(bits=32, segments=((PT_LOAD, 0x1000),))),
+            load_alignments(elf(bits=32, segments=((PT_LOAD, 0x1000),))),
             (32, [0x1000]),
         )
 
@@ -161,25 +188,24 @@ class TestLoadSegmentAlignments(unittest.TestCase):
         # huge alignment, which would pass. The byte order has to be honored.
         segments = ((PT_LOAD, 0x1000),)
         self.assertEqual(
-            load_segment_alignments(elf(endian=">", segments=segments)),
+            load_alignments(elf(endian=">", segments=segments)),
             (64, [0x1000]),
         )
 
 
 class TestElfFinding(unittest.TestCase):
     def test_a_16k_aligned_64_bit_library_passes(self) -> None:
-        self.assertIsNone(elf_finding("lib.so", elf()))
+        self.assertIsNone(only_reason(elf()))
 
     def test_a_64k_aligned_library_passes(self) -> None:
         # Larger than a 16 KB page is still a multiple of one; prebuilt engines
         # ship at 0x10000 and must not be reported.
-        self.assertIsNone(elf_finding("lib.so", elf(segments=((PT_LOAD, 0x10000),))))
+        self.assertIsNone(only_reason(elf(segments=((PT_LOAD, 0x10000),))))
 
     def test_a_4k_aligned_64_bit_library_is_reported(self) -> None:
-        found = elf_finding("lib.so", elf(segments=((PT_LOAD, 0x1000),)))
-        self.assertIsNotNone(found)
+        found = only_reason(elf(segments=((PT_LOAD, 0x1000),)))
         assert found is not None
-        self.assertEqual(found.reason, "LOAD segment alignment 0x1000, needs 0x4000")
+        self.assertEqual(found, "LOAD segment alignment 0x1000, needs 0x4000")
 
     def test_each_short_alignment_is_named_once(self) -> None:
         segments = (
@@ -188,40 +214,38 @@ class TestElfFinding(unittest.TestCase):
             (PT_LOAD, 0x2000),
             (PT_LOAD, 0x1000),
         )
-        found = elf_finding("lib.so", elf(segments=segments))
+        found = only_reason(elf(segments=segments))
         assert found is not None
-        self.assertEqual(
-            found.reason, "LOAD segment alignment 0x1000, 0x2000, needs 0x4000"
-        )
+        self.assertEqual(found, "LOAD segment alignment 0x1000, 0x2000, needs 0x4000")
 
     def test_a_segment_other_than_load_does_not_count(self) -> None:
         # PT_GNU_STACK and PT_DYNAMIC carry small alignments in every real
         # library; reading them as LOAD would fail everything.
         segments = ((PT_LOAD, 0x4000), (PT_GNU_STACK, 0x10), (PT_DYNAMIC, 8))
-        self.assertIsNone(elf_finding("lib.so", elf(segments=segments)))
+        self.assertIsNone(only_reason(elf(segments=segments)))
 
     def test_a_32_bit_library_at_4k_is_exempt_rather_than_a_failure(self) -> None:
         # Not a skip: the NDK scopes flexible page sizes to the 64-bit ABIs, so
         # its own 32-bit output is 0x1000. The module docstring says where.
-        found = elf_finding("lib.so", elf(bits=32, segments=((PT_LOAD, 0x1000),)))
+        found = only_reason(elf(bits=32, segments=((PT_LOAD, 0x1000),)))
         self.assertIsNone(found)
 
     def test_a_64_bit_library_with_no_load_segment_is_reported(self) -> None:
-        found = elf_finding("lib.so", elf(segments=((PT_DYNAMIC, 8),)))
+        found = only_reason(elf(segments=((PT_DYNAMIC, 8),)))
         assert found is not None
-        self.assertEqual(found.reason, "no PT_LOAD segment")
+        self.assertEqual(found, "no PT_LOAD segment")
 
     def test_something_that_is_not_an_elf_fails_closed(self) -> None:
-        found = elf_finding("lib.so", b"not an ELF at all" * 8)
+        found = only_reason(b"not an ELF at all" * 8)
         assert found is not None
-        self.assertIn("not an ELF file", found.reason)
+        self.assertIn("not an ELF file", found)
 
     def test_an_unknown_elf_class_fails_closed(self) -> None:
         raw = bytearray(elf())
         raw[4] = 3
-        found = elf_finding("lib.so", bytes(raw))
+        found = only_reason(bytes(raw))
         assert found is not None
-        self.assertIn("unknown ELF class 3", found.reason)
+        self.assertIn("unknown ELF class 3", found)
 
     def test_an_unknown_elf_data_encoding_fails_closed(self) -> None:
         # The case a fallback byte order gets wrong: a big-endian header with
@@ -231,10 +255,10 @@ class TestElfFinding(unittest.TestCase):
             with self.subTest(ei_data=ei_data):
                 raw = bytearray(elf(endian=">"))
                 raw[5] = ei_data
-                found = elf_finding("lib.so", bytes(raw))
+                found = only_reason(bytes(raw))
                 assert found is not None
                 self.assertEqual(
-                    found.reason,
+                    found,
                     f"unreadable as ELF (unknown ELF data encoding {ei_data})",
                 )
 
@@ -243,21 +267,155 @@ class TestElfFinding(unittest.TestCase):
         # taken on faith: a stride below the fields the parser reads still lands
         # inside the file, so the read returns neighboring bytes rather than
         # raising, and garbage reads as a large alignment - a pass.
-        found = elf_finding("lib.so", elf(segments=((PT_LOAD, 0x1000),), phentsize=8))
+        found = only_reason(elf(segments=((PT_LOAD, 0x1000),), phentsize=8))
         assert found is not None
-        self.assertIn("program header entry size 8", found.reason)
+        self.assertIn("program header entry size 8", found)
 
     def test_a_program_header_table_past_the_end_fails_closed(self) -> None:
         # A truncated library must not pass on the segments that happened to
         # survive.
-        found = elf_finding("lib.so", elf()[:-1])
+        found = only_reason(elf()[:-1])
         assert found is not None
-        self.assertIn("runs past the end", found.reason)
+        self.assertIn("runs past the end", found)
 
     def test_a_file_too_short_for_a_header_fails_closed(self) -> None:
-        found = elf_finding("lib.so", elf()[:40])
+        found = only_reason(elf()[:40])
         assert found is not None
-        self.assertIn("too short", found.reason)
+        self.assertIn("too short", found)
+
+
+# Google's guide's own examples (developer.android.com/guide/practices/page-sizes,
+# "Check the RELRO security flag"), as `(p_type, p_align, p_vaddr, p_memsz)`. The
+# executable LOAD every example opens with is the same.
+_TEXT = (PT_LOAD, 0x4000, 0x0, 0xCFAF0)
+# Example 1, non-compliant: the RELRO ends at 0xe1000, off a 16 KB boundary,
+# and its LOAD runs on to 0xe4000.
+_SHARED_UNALIGNED = (
+    _TEXT,
+    (PT_LOAD, 0x4000, 0xDFAF0, 0x4510),
+    (PT_GNU_RELRO, 1, 0xDFAF0, 0x1510),
+)
+_SHARED_UNALIGNED_REASON = (
+    "GNU_RELRO ends at 0xe1000, not a 0x4000 boundary, "
+    "and its LOAD segment ends at 0xe4000"
+)
+# Example 2, compliant by the second way: the RELRO ends at 0xe0000.
+_SHARED_ALIGNED = (
+    _TEXT,
+    (PT_LOAD, 0x4000, 0xDFAF0, 0x3510),
+    (PT_GNU_RELRO, 1, 0xDFAF0, 0x510),
+)
+# Example 3, compliant by the first way: no GNU_RELRO.
+_NO_RELRO = (
+    (PT_LOAD, 0x4000, 0x0, 0x680),
+    (PT_LOAD, 0x4000, 0x4680, 0x1D8),
+)
+# Example 4, compliant by the third way: the RELRO ends at 0x5000, off a
+# boundary, exactly where its containing LOAD ends.
+_OWN_LOAD = (
+    (PT_LOAD, 0x4000, 0x0, 0x680),
+    (PT_LOAD, 0x4000, 0x4680, 0x980),
+    (PT_GNU_RELRO, 1, 0x4680, 0x980),
+)
+
+
+class TestProgramHeaders(unittest.TestCase):
+    def test_each_segment_is_read_with_its_place_and_size(self) -> None:
+        # The RELRO verdict rests on p_vaddr and p_memsz, which sit at other
+        # offsets in each class; the fixture packs whole structures, so a wrong
+        # offset in the parser reads a neighbouring field instead.
+        relro = (PT_GNU_RELRO, 1, 0x12340, 0x560)
+        for bits, endian in ((64, "<"), (64, ">"), (32, "<")):
+            with self.subTest(bits=bits, endian=endian):
+                _, segments = program_headers(
+                    elf(bits=bits, endian=endian, segments=(relro,))
+                )
+                (segment,) = segments
+                self.assertEqual(
+                    (segment.p_type, segment.align, segment.vaddr, segment.memsz),
+                    relro,
+                )
+
+
+class TestRelroEnd(unittest.TestCase):
+    """Google's three ways, read as the guide states them."""
+
+    def test_the_guides_compliant_examples_pass(self) -> None:
+        for label, segments in {
+            "example 2, an aligned end": _SHARED_ALIGNED,
+            "example 3, no GNU_RELRO": _NO_RELRO,
+            "example 4, ending with its LOAD": _OWN_LOAD,
+        }.items():
+            with self.subTest(label):
+                self.assertIsNone(only_reason(elf(segments=segments)))
+
+    def test_ending_with_its_load_passes_off_a_boundary(self) -> None:
+        # The misreading this guards: the end alone is off a 16 KB boundary in
+        # example 4, as it is in most libraries LLD links, so a check reading
+        # only the second way would fail a compliant library.
+        self.assertNotEqual((0x4680 + 0x980) % PAGE_16K, 0)
+        self.assertIsNone(only_reason(elf(segments=_OWN_LOAD)))
+
+    def test_the_guides_non_compliant_example_is_reported(self) -> None:
+        self.assertEqual(
+            only_reason(elf(segments=_SHARED_UNALIGNED)), _SHARED_UNALIGNED_REASON
+        )
+
+    def test_the_containing_load_is_the_one_holding_the_relro_start(self) -> None:
+        # Segments that abut in memory, as LLD lays them out: the LOAD whose
+        # end is the RELRO's start does not contain it, and taking it for the
+        # container would compare the wrong end.
+        segments = (
+            (PT_LOAD, 0x4000, 0x0, 0x4680),
+            (PT_LOAD, 0x4000, 0x4680, 0x980),
+            (PT_GNU_RELRO, 1, 0x4680, 0x980),
+        )
+        self.assertIsNone(only_reason(elf(segments=segments)))
+
+    def test_a_relro_no_load_contains_meets_none_of_the_ways(self) -> None:
+        segments = (_TEXT, (PT_GNU_RELRO, 1, 0xDFAF0, 0x1510))
+        self.assertEqual(
+            only_reason(elf(segments=segments)),
+            "GNU_RELRO ends at 0xe1000, not a 0x4000 boundary, "
+            "and no LOAD segment contains it",
+        )
+
+    def test_a_relro_ending_before_its_load_ends_is_reported(self) -> None:
+        # The third way is an exact end, not "inside": a LOAD running on past
+        # the RELRO end is example 1's shape whatever lies beyond.
+        segments = (
+            _TEXT,
+            (PT_LOAD, 0x4000, 0xDFAF0, 0x1600),
+            (PT_GNU_RELRO, 1, 0xDFAF0, 0x1510),
+        )
+        self.assertEqual(
+            only_reason(elf(segments=segments)),
+            "GNU_RELRO ends at 0xe1000, not a 0x4000 boundary, "
+            "and its LOAD segment ends at 0xe10f0",
+        )
+
+    def test_each_gnu_relro_header_is_read_on_its_own(self) -> None:
+        # The guide speaks of one; a second is held to the same condition.
+        segments = (*_OWN_LOAD, (PT_GNU_RELRO, 1, 0x4680, 0x100))
+        self.assertEqual(
+            only_reason(elf(segments=segments)),
+            "GNU_RELRO ends at 0x4780, not a 0x4000 boundary, "
+            "and its LOAD segment ends at 0x5000",
+        )
+
+    def test_a_32_bit_library_is_exempt(self) -> None:
+        # As for LOAD alignment: the 16 KB requirement covers the 64-bit ABIs.
+        self.assertIsNone(only_reason(elf(bits=32, segments=_SHARED_UNALIGNED)))
+
+    def test_a_short_load_alignment_and_a_bad_relro_end_are_both_named(self) -> None:
+        segments = ((PT_LOAD, 0x1000, 0x0, 0xCFAF0), *_SHARED_UNALIGNED[1:])
+        self.assertEqual(
+            [f.reason for f in elf_findings("lib.so", elf(segments=segments))],
+            [
+                "LOAD segment alignment 0x1000, needs 0x4000",
+                _SHARED_UNALIGNED_REASON,
+            ],
+        )
 
 
 class TestZipDataOffset(TempDirTest):
@@ -387,6 +545,21 @@ class TestArtifactFindings(TempDirTest):
         compressed = [f.entry for f in artifact_findings(path) if "stored" in f.reason]
         self.assertEqual(compressed, ["lib/arm64-v8a/bad.so"])
 
+    def test_an_artifacts_libraries_take_the_relro_condition(self) -> None:
+        path = write_archive(
+            self.tmp / "a.aab",
+            [
+                (
+                    "base/lib/arm64-v8a/x.so",
+                    elf(segments=_SHARED_UNALIGNED),
+                    zipfile.ZIP_DEFLATED,
+                )
+            ],
+        )
+        self.assertEqual(
+            [f.reason for f in artifact_findings(path)], [_SHARED_UNALIGNED_REASON]
+        )
+
     def test_an_artifact_with_no_native_libraries_is_reported(self) -> None:
         # A pass over an empty set is the failure a gate is most likely to
         # have: a moved build output path would otherwise pass silently.
@@ -424,7 +597,7 @@ class TestCommand(TempDirTest):
             err.startswith(
                 f"FAIL {path}\n"
                 "  base/lib/arm64-v8a/x.so: LOAD segment alignment 0x1000, needs 0x4000\n"
-                "\nA 16 KB-page device would refuse to load the libraries above."
+                "\nThe libraries above fail a 16 KB condition Google documents."
             ),
             err,
         )
@@ -495,6 +668,13 @@ class TestCommand(TempDirTest):
         they would in an archive written that way."""
         for header, at in ((b"PK\x03\x04", local_at), (b"PK\x01\x02", central_at)):
             struct.pack_into("<H", raw, raw.index(header) + at, value)
+
+    def test_a_shared_library_on_its_own_takes_the_relro_condition(self) -> None:
+        path = self.tmp / "libbad.so"
+        path.write_bytes(elf(segments=_SHARED_UNALIGNED))
+        status, out, err = run(["android-page-align", str(path)])
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn(f"  libbad.so: {_SHARED_UNALIGNED_REASON}\n", err)
 
     def test_a_shared_library_on_its_own_takes_the_elf_condition(self) -> None:
         # Checking a library before it is packaged: no archive, so no

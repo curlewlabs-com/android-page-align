@@ -14,13 +14,14 @@ cause. Reading the artifact covers every packaged ABI of the build that ships,
 needs no device, and names the library and the reason.
 
 WHAT A PASS MEANS, because it is narrower than "the app works on 16 KB pages":
-every packaged library CAN be mapped by a 16 KB-page loader. It says nothing
-about code that assumes a page is 4096 bytes once it is running, and it does
-not read the end alignment of `PT_GNU_RELRO` or an app bundle's own
-page-alignment setting. The README lists what a pass does not cover.
+every packaged library meets the 16 KB conditions Google documents, read from
+its headers. It says nothing about code that assumes a page is 4096 bytes once
+it is running, it is not a model of the Android loader, and it does not read
+an app bundle's own page-alignment setting. The README lists what a pass does
+not cover.
 
-LOAD ALIGNMENT AND ZIP PLACEMENT, because a 16 KB device rejects an artifact
-when either requirement fails.
+LOAD ALIGNMENT, RELRO END AND ZIP PLACEMENT, the three conditions Google's
+16 KB guide documents (developer.android.com/guide/practices/page-sizes).
 
   ELF LOAD ALIGNMENT - every `PT_LOAD` segment of every 64-bit `.so` declares
     `p_align` of at least 16 KB. 32-bit ABIs are exempt, and the reason is
@@ -33,6 +34,17 @@ when either requirement fails.
     `armeabi-v7a`: applying the bar there would fail an artifact on libraries
     Google's own toolchain produced, and the only ways to pass it would be
     patching a third-party prebuilt or dropping 32-bit devices.
+
+  RELRO END - every 64-bit `.so` meets the condition the guide's "Check the
+    RELRO security flag" section states, read exactly as stated: it has no
+    `PT_GNU_RELRO`; or the RELRO end (`p_vaddr + p_memsz`) is a multiple of
+    16 KB; or the RELRO ends exactly where its containing `PT_LOAD` segment
+    ends. Each `GNU_RELRO` header is read on its own. All three ways are read,
+    because the second alone is the misreading: LLD pads the RELRO end only to
+    4 KB and gives writable data a `LOAD` of its own, so most current libraries
+    fail the second and comply by the third. This is the documented condition,
+    not the loader's behavior; the README names the layouts it does not speak
+    to. 32-bit ABIs are exempt, as for LOAD alignment.
 
   ZIP PLACEMENT, for an APK only. An app that stores its native libraries
     uncompressed (`extractNativeLibs="false"` in its merged manifest) is
@@ -50,15 +62,15 @@ Such an APK fails here by design. Compressing the libraries is a packaging
 decision with a 16 KB consequence for an app that maps them in place, and this
 check is for apps that do.
 
-A shared library given on its own (a `.so` path) takes the ELF condition, for a
-library checked before it is packaged; placement is a property of an APK entry,
-so it does not apply.
+A shared library given on its own (a `.so` path) takes the two ELF conditions,
+for a library checked before it is packaged; placement is a property of an APK
+entry, so it does not apply.
 
 Usage:
   android-page-align <artifact.apk|artifact.aab|library.so> [...]
 
 Exit codes:
-  0 - every native library clears its load and placement conditions
+  0 - every native library clears its load, RELRO and placement conditions
   1 - one or more do not, or an input could not be read
 """
 
@@ -81,6 +93,7 @@ ELFCLASS64: Final = 2
 ELFDATA2LSB: Final = 1
 ELFDATA2MSB: Final = 2
 PT_LOAD: Final = 1
+PT_GNU_RELRO: Final = 0x6474E552
 
 # `lib/<abi>/<name>.so` - the layout the loader maps out of an APK, as opposed to
 # a `.so` riding in assets, which it does not. Not anchored at the start of the
@@ -107,8 +120,22 @@ class Finding:
         return f"  {self.entry}: {self.reason}"
 
 
-def load_segment_alignments(elf: bytes) -> tuple[int, list[int]]:
-    """`(ELF class in bits, p_align of each PT_LOAD segment)`.
+@dataclass(frozen=True, slots=True)
+class Segment:
+    """The fields of one program header that the conditions read."""
+
+    p_type: int
+    vaddr: int
+    memsz: int
+    align: int
+
+    @property
+    def end(self) -> int:
+        return self.vaddr + self.memsz
+
+
+def program_headers(elf: bytes) -> tuple[int, list[Segment]]:
+    """`(ELF class in bits, every program header)`.
 
     ELF32, ELF64, little-endian, and big-endian encodings are read rather than
     assumed, because the packaged set spans them: arm64-v8a and x86_64 are
@@ -133,10 +160,14 @@ def load_segment_alignments(elf: bytes) -> tuple[int, list[int]]:
     else:
         raise NotAnElf(f"unknown ELF data encoding {ei_data}")
 
+    # Offsets of e_phoff, of e_phentsize (e_phnum follows it), and of p_vaddr,
+    # p_memsz and p_align within one program header, per ELF class.
     if ei_class == ELFCLASS64:
-        bits, ph_at, count_at, align_at, word = 64, 0x20, 0x36, 0x30, "Q"
+        bits, ph_at, count_at, word = 64, 0x20, 0x36, "Q"
+        vaddr_at, memsz_at, align_at = 0x10, 0x28, 0x30
     elif ei_class == ELFCLASS32:
-        bits, ph_at, count_at, align_at, word = 32, 0x1C, 0x2A, 0x1C, "I"
+        bits, ph_at, count_at, word = 32, 0x1C, 0x2A, "I"
+        vaddr_at, memsz_at, align_at = 0x08, 0x14, 0x1C
     else:
         raise NotAnElf(f"unknown ELF class {ei_class}")
 
@@ -145,40 +176,73 @@ def load_segment_alignments(elf: bytes) -> tuple[int, list[int]]:
     # A stride shorter than the fields read below would still land inside the
     # file, so `unpack_from` would return neighboring bytes rather than raise -
     # and a garbage `p_align` reads as large, which is the fail-OPEN direction.
+    # p_align is the last field read in both classes.
     min_entry = align_at + struct.calcsize(word)
     if phentsize < min_entry:
         raise NotAnElf(f"program header entry size {phentsize} is below {min_entry}")
 
-    alignments: list[int] = []
+    segments: list[Segment] = []
     for i in range(phnum):
         at = phoff + i * phentsize
         if at + phentsize > len(elf):
             raise NotAnElf("program header table runs past the end of the file")
         (p_type,) = struct.unpack_from(endian + "I", elf, at)
-        if p_type == PT_LOAD:
-            (p_align,) = struct.unpack_from(endian + word, elf, at + align_at)
-            alignments.append(p_align)
-    return bits, alignments
+        (vaddr,) = struct.unpack_from(endian + word, elf, at + vaddr_at)
+        (memsz,) = struct.unpack_from(endian + word, elf, at + memsz_at)
+        (p_align,) = struct.unpack_from(endian + word, elf, at + align_at)
+        segments.append(Segment(p_type, vaddr, memsz, p_align))
+    return bits, segments
 
 
-def elf_finding(entry: str, elf: bytes) -> Finding | None:
-    """The reason `entry` would not map on a 16 KB-page device, if there is one."""
+def relro_reason(relro: Segment, loads: list[Segment]) -> str | None:
+    """Why `relro` meets none of the guide's three ways, if it meets none.
+
+    The caller found a `GNU_RELRO`, so the first way is gone; this reads the
+    other two as the guide states them. The containing `LOAD` is the one that
+    holds the RELRO's start.
+    """
+    if relro.end % PAGE_16K == 0:
+        return None
+    containing = [s for s in loads if s.vaddr <= relro.vaddr < s.end]
+    if not containing:
+        return (
+            f"GNU_RELRO ends at 0x{relro.end:x}, not a 0x{PAGE_16K:x} boundary, "
+            "and no LOAD segment contains it"
+        )
+    if containing[0].end == relro.end:
+        return None
+    return (
+        f"GNU_RELRO ends at 0x{relro.end:x}, not a 0x{PAGE_16K:x} boundary, "
+        f"and its LOAD segment ends at 0x{containing[0].end:x}"
+    )
+
+
+def elf_findings(entry: str, elf: bytes) -> list[Finding]:
+    """Each reason `entry` fails a 16 KB condition, empty if it meets them."""
     try:
-        bits, alignments = load_segment_alignments(elf)
+        bits, segments = program_headers(elf)
     except (NotAnElf, struct.error) as e:
         # Fail closed: an entry named `.so` that this cannot read is not a pass.
-        return Finding(entry, f"unreadable as ELF ({e})")
+        return [Finding(entry, f"unreadable as ELF ({e})")]
 
     if bits != 64:
-        return None
-    if not alignments:
-        return Finding(entry, "no PT_LOAD segment")
+        return []
+    loads = [s for s in segments if s.p_type == PT_LOAD]
+    if not loads:
+        return [Finding(entry, "no PT_LOAD segment")]
 
-    under = sorted({a for a in alignments if a < PAGE_16K})
+    findings: list[Finding] = []
+    under = sorted({s.align for s in loads if s.align < PAGE_16K})
     if under:
         shown = ", ".join(f"0x{a:x}" for a in under)
-        return Finding(entry, f"LOAD segment alignment {shown}, needs 0x{PAGE_16K:x}")
-    return None
+        findings.append(
+            Finding(entry, f"LOAD segment alignment {shown}, needs 0x{PAGE_16K:x}")
+        )
+    for relro in (s for s in segments if s.p_type == PT_GNU_RELRO):
+        reason = relro_reason(relro, loads)
+        if reason:
+            findings.append(Finding(entry, reason))
+    return findings
 
 
 def zip_data_offset(fp: BinaryIO, header_offset: int) -> int:
@@ -213,17 +277,15 @@ def read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
 
 
 def library_findings(path: Path) -> list[Finding]:
-    """The reason the shared library at `path` would not load on a 16 KB-page
-    device, if there is one."""
-    found = elf_finding(path.name, path.read_bytes())
-    return [found] if found else []
+    """Each reason the shared library at `path` fails a 16 KB condition."""
+    return elf_findings(path.name, path.read_bytes())
 
 
 def artifact_findings(path: Path) -> list[Finding]:
     """Every reason `path` would not load on a 16 KB-page device."""
     findings: list[Finding] = []
     # Only an APK is installed as-is; see the module docstring on why an AAB
-    # takes the ELF condition and not the placement one.
+    # takes the ELF conditions and not the placement one.
     check_placement = path.suffix == ".apk"
 
     # A second handle for the local-header reads rather than seeking the one
@@ -240,9 +302,7 @@ def artifact_findings(path: Path) -> list[Finding]:
             return [Finding(path.name, "no native libraries found - wrong artifact?")]
 
         for info in libs:
-            found = elf_finding(info.filename, read_member(archive, info))
-            if found:
-                findings.append(found)
+            findings += elf_findings(info.filename, read_member(archive, info))
 
             if not (check_placement and _PACKAGED_LIB.search(info.filename)):
                 continue
@@ -296,9 +356,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if failed:
         print(
-            "\nA 16 KB-page device would refuse to load the libraries above. If one\n"
-            "arrived with a dependency, the fix is upstream or a pinned version that\n"
-            "links with -Wl,-z,max-page-size=16384; see\n"
+            "\nThe libraries above fail a 16 KB condition Google documents. If one\n"
+            "arrived with a dependency, the fix is upstream or a pinned version\n"
+            "built with NDK r28 or newer, or linked with\n"
+            "-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384; see\n"
             "https://github.com/curlewlabs-com/android-page-align.",
             file=sys.stderr,
         )
