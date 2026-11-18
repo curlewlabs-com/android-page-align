@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "android-page-align"
-version = "0.1.1"
+version = "0.2.0"
 description = "Check that every native library in an Android APK or app bundle can load on 16 KB memory pages."
 readme = "README.md"
 license = "MIT OR Apache-2.0"

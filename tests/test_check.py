@@ -496,6 +496,48 @@ class TestCommand(TempDirTest):
         for header, at in ((b"PK\x03\x04", local_at), (b"PK\x01\x02", central_at)):
             struct.pack_into("<H", raw, raw.index(header) + at, value)
 
+    def test_a_shared_library_on_its_own_takes_the_elf_condition(self) -> None:
+        # Checking a library before it is packaged: no archive, so no
+        # placement condition, and the finding names the file.
+        good = self.tmp / "libgood.so"
+        good.write_bytes(elf())
+        bad = self.tmp / "libbad.so"
+        bad.write_bytes(elf(segments=((PT_LOAD, 0x1000),)))
+        status, out, err = run(["android-page-align", str(good), str(bad)])
+        self.assertEqual((status, out), (1, f"OK {good}: maps on 16 KB pages\n"))
+        self.assertTrue(
+            err.startswith(
+                f"FAIL {bad}\n"
+                "  libbad.so: LOAD segment alignment 0x1000, needs 0x4000\n"
+            ),
+            err,
+        )
+
+    def test_a_32_bit_shared_library_on_its_own_is_exempt(self) -> None:
+        path = self.tmp / "libold.so"
+        path.write_bytes(elf(bits=32, segments=((PT_LOAD, 0x1000),)))
+        self.assertEqual(
+            run(["android-page-align", str(path)]),
+            (0, f"OK {path}: maps on 16 KB pages\n", ""),
+        )
+
+    def test_a_shared_library_that_is_not_an_elf_fails_closed(self) -> None:
+        # A loose file is not looked for inside an archive, so a zip named
+        # `.so` is judged as the ELF it claims to be, and is not one.
+        path = write_archive(
+            self.tmp / "libx.so", [("lib/arm64-v8a/x.so", elf(), zipfile.ZIP_STORED)]
+        )
+        status, out, err = run(["android-page-align", str(path)])
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn("  libx.so: unreadable as ELF (not an ELF file)", err)
+
+    def test_a_missing_shared_library_is_a_failure_not_a_pass(self) -> None:
+        status, out, err = run(["android-page-align", str(self.tmp / "absent.so")])
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn(
+            f"FAIL {self.tmp / 'absent.so'}: could not read the library:", err
+        )
+
     def test_a_missing_artifact_is_a_failure_not_a_pass(self) -> None:
         status, out, err = run(["android-page-align", str(self.tmp / "absent.apk")])
         self.assertEqual((status, out), (1, ""))
