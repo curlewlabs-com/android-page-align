@@ -2,10 +2,10 @@
 
 ## What it is
 
-A check that every native library in an Android APK or app bundle (`.aab`)
-can be loaded on a device that uses 16 KB memory pages. It reads the artifact
-itself, using only the Python standard library, and exits 1 naming each
-library that fails and the reason. It needs no Android SDK, NDK, emulator or
+A check that every native library in an Android APK or app bundle (`.aab`),
+or a shared library on its own, can be loaded on a device that uses 16 KB
+memory pages. It reads the files themselves, using only the Python standard
+library, and exits 1 naming each library that fails and the reason. It needs no Android SDK, NDK, emulator or
 device, so it runs as a CI step anywhere Python runs.
 
 ## Why it exists
@@ -35,21 +35,25 @@ library.
 It needs Python 3.12 or newer. It has no dependencies.
 
 ```sh
-pip install git+https://github.com/curlewlabs-com/android-page-align@v0.1.1
+pip install git+https://github.com/curlewlabs-com/android-page-align@v0.2.0
 
 android-page-align app/build/outputs/apk/release/app-release.apk
 android-page-align app/build/outputs/bundle/release/app-release.aab
+android-page-align build/arm64-v8a/libfoo.so
 ```
 
 `python3 -m android_page_align` works the same way.
 `src/android_page_align/check.py` imports only the standard library, so you can
 also copy that one file and run it with `python3 check.py`.
 
-Give it one or more artifacts. Its only inputs are the artifact paths; there
-are no options. For each artifact that passes it prints one line to stdout:
+Give it one or more paths. Its only inputs are those paths; there are no
+options. A path ending `.so` is read as one shared library, which checks it
+before it is packaged; anything else is read as an APK or app bundle. For each
+input that passes it prints one line to stdout:
 
 ```
 OK app-release.aab: every packaged native library maps on 16 KB pages
+OK build/arm64-v8a/libfoo.so: maps on 16 KB pages
 ```
 
 For each one that fails, it prints the artifact and one line per finding to
@@ -61,9 +65,9 @@ FAIL app-release.apk
   lib/x86_64/libbar.so: compressed in the APK, must be stored
 ```
 
-It also exits 1, with the reason, when it cannot read an artifact, when an
+It also exits 1, with the reason, when it cannot read an input, when an
 artifact holds no `.so` at all (usually the wrong file), and when it is given
-no artifact. A check that judged nothing never reads as a pass.
+no input. A check that judged nothing never reads as a pass.
 
 ## What it checks
 
@@ -82,6 +86,9 @@ no artifact. A check that judged nothing never reads as a pass.
 - **In an APK** (a file whose name ends `.apk`), every `lib/<abi>/<name>.so`
   entry must be stored uncompressed and start on a 16 KB boundary. The offset
   is read from the entry's local header, where `zipalign` writes its padding.
+- **A shared library given on its own** (a path ending `.so`) takes the ELF
+  rule. Where it will sit in an APK is not known yet, so placement is not
+  checked.
 
 ## What a pass does not cover
 

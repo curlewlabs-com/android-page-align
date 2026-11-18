@@ -1,8 +1,8 @@
 """Refuse an Android artifact whose native libraries cannot load on 16 KB pages.
 
 Owns the whole check: reading each native library's ELF program headers out of
-an APK or app bundle, reading where each library's bytes start inside an APK,
-and the verdict. It imports only the standard library, so this file also runs
+an APK or app bundle, or from a shared library given on its own, reading where
+each library's bytes start inside an APK, and the verdict. It imports only the standard library, so this file also runs
 on its own.
 
 WHY READ THE ARTIFACT. Most of the native code an app packages is not built by
@@ -50,12 +50,16 @@ Such an APK fails here by design. Compressing the libraries is a packaging
 decision with a 16 KB consequence for an app that maps them in place, and this
 check is for apps that do.
 
+A shared library given on its own (a `.so` path) takes the ELF condition, for a
+library checked before it is packaged; placement is a property of an APK entry,
+so it does not apply.
+
 Usage:
-  android-page-align <artifact.apk|artifact.aab> [...]
+  android-page-align <artifact.apk|artifact.aab|library.so> [...]
 
 Exit codes:
-  0 - every packaged native library clears its load and placement conditions
-  1 - one or more do not, or an artifact could not be read
+  0 - every native library clears its load and placement conditions
+  1 - one or more do not, or an input could not be read
 """
 
 from __future__ import annotations
@@ -208,6 +212,13 @@ def read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
         raise UnreadableMember(f"{info.filename}: {e}") from e
 
 
+def library_findings(path: Path) -> list[Finding]:
+    """The reason the shared library at `path` would not load on a 16 KB-page
+    device, if there is one."""
+    found = elf_finding(path.name, path.read_bytes())
+    return [found] if found else []
+
+
 def artifact_findings(path: Path) -> list[Finding]:
     """Every reason `path` would not load on a 16 KB-page device."""
     findings: list[Finding] = []
@@ -256,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv
     if len(argv) < 2:
         print(
-            "usage: android-page-align <artifact.apk|artifact.aab> [...]",
+            "usage: android-page-align <artifact.apk|artifact.aab|library.so> [...]",
             file=sys.stderr,
         )
         return 1
@@ -264,10 +275,12 @@ def main(argv: list[str] | None = None) -> int:
     failed = False
     for arg in argv[1:]:
         path = Path(arg)
+        library = path.suffix == ".so"
         try:
-            findings = artifact_findings(path)
+            findings = library_findings(path) if library else artifact_findings(path)
         except (OSError, zipfile.BadZipFile, ValueError, UnreadableMember) as e:
-            print(f"FAIL {path}: could not read the artifact: {e}", file=sys.stderr)
+            what = "library" if library else "artifact"
+            print(f"FAIL {path}: could not read the {what}: {e}", file=sys.stderr)
             failed = True
             continue
 
@@ -276,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"FAIL {path}", file=sys.stderr)
             for finding in findings:
                 print(str(finding), file=sys.stderr)
+        elif library:
+            print(f"OK {path}: maps on 16 KB pages")
         else:
             print(f"OK {path}: every packaged native library maps on 16 KB pages")
 
