@@ -35,7 +35,7 @@ library.
 It needs Python 3.12 or newer. It has no dependencies.
 
 ```sh
-pip install git+https://github.com/curlewlabs-com/android-page-align@v0.1.0
+pip install git+https://github.com/curlewlabs-com/android-page-align@v0.1.1
 
 android-page-align app/build/outputs/apk/release/app-release.apk
 android-page-align app/build/outputs/bundle/release/app-release.aab
