@@ -117,14 +117,6 @@ installed:
   headers.
 - Android Studio's APK Analyzer and lint flag unaligned libraries in the IDE.
 
-## Known issues
-
-- **An archive member Python's `zipfile` cannot decompress stops the run.**
-  Encrypted entries, an unsupported compression method, or a corrupt deflate
-  stream raise a traceback instead of printing a `FAIL` line. The exit status is
-  still 1, but artifacts named after that one on the same command line are not
-  checked.
-
 ## License
 
 Licensed under either of

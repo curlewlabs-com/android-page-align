@@ -89,6 +89,10 @@ class NotAnElf(Exception):
     """The bytes at a `.so` entry are not an ELF this module can read."""
 
 
+class UnreadableMember(Exception):
+    """A `.so` entry's bytes could not be read out of the archive."""
+
+
 @dataclass(frozen=True, slots=True)
 class Finding:
     entry: str
@@ -188,6 +192,22 @@ def zip_data_offset(fp: BinaryIO, header_offset: int) -> int:
     return int(header_offset + 30 + name_len + extra_len)
 
 
+def read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """The uncompressed bytes of `info`, or `UnreadableMember` naming it."""
+    try:
+        return archive.read(info)
+    except Exception as e:
+        # Every exception rather than a list, because the set is not fixed: it
+        # depends on the entry's compression method and on the Python version.
+        # zlib.error and EOFError for deflate, OSError for bzip2,
+        # lzma.LZMAError, a Zstandard error from 3.14, RuntimeError for an
+        # encrypted entry, NotImplementedError for a method zipfile lacks,
+        # BadZipFile for a CRC mismatch. Each means the artifact cannot be
+        # read, and a list would leave the next one to end the run with a
+        # traceback before the remaining artifacts are checked.
+        raise UnreadableMember(f"{info.filename}: {e}") from e
+
+
 def artifact_findings(path: Path) -> list[Finding]:
     """Every reason `path` would not load on a 16 KB-page device."""
     findings: list[Finding] = []
@@ -209,7 +229,7 @@ def artifact_findings(path: Path) -> list[Finding]:
             return [Finding(path.name, "no native libraries found - wrong artifact?")]
 
         for info in libs:
-            found = elf_finding(info.filename, archive.read(info))
+            found = elf_finding(info.filename, read_member(archive, info))
             if found:
                 findings.append(found)
 
@@ -246,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         path = Path(arg)
         try:
             findings = artifact_findings(path)
-        except (OSError, zipfile.BadZipFile, ValueError) as e:
+        except (OSError, zipfile.BadZipFile, ValueError, UnreadableMember) as e:
             print(f"FAIL {path}: could not read the artifact: {e}", file=sys.stderr)
             failed = True
             continue
