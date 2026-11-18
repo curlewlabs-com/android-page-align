@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import override
 
@@ -438,6 +439,62 @@ class TestCommand(TempDirTest):
             out, f"OK {good}: every packaged native library maps on 16 KB pages\n"
         )
         self.assertIn(f"FAIL {bad}: could not read the artifact:", err)
+
+    def test_an_entry_zipfile_cannot_read_fails_its_artifact_alone(self) -> None:
+        # Each of these raised out of `main` as a traceback, so the artifacts
+        # after it on the command line were never checked. Each is a different
+        # exception type, which is why the catch is not a list of them.
+        cases: dict[str, Callable[[bytearray], None]] = {
+            # BFINAL set and BTYPE 11, a block type deflate reserves: zlib.error.
+            "a corrupt deflate stream": lambda raw: raw.__setitem__(
+                self.data_offset(raw), 0x07
+            ),
+            # General-purpose flag bit 0, in both headers: RuntimeError.
+            "an encrypted entry": lambda raw: self.set_header_field(raw, 6, 8, 0x1),
+            # Method 99 is not one zipfile knows: NotImplementedError.
+            "an unknown compression method": lambda raw: self.set_header_field(
+                raw, 8, 10, 99
+            ),
+        }
+        good = write_aligned_apk(self.tmp / "good.apk", "lib/x86_64/x.so", elf())
+        for label, corrupt in cases.items():
+            with self.subTest(label):
+                bad = write_archive(
+                    self.tmp / "bad.aab",
+                    [("base/lib/arm64-v8a/x.so", elf(), zipfile.ZIP_DEFLATED)],
+                )
+                raw = bytearray(bad.read_bytes())
+                corrupt(raw)
+                bad.write_bytes(raw)
+                status, out, err = run(["android-page-align", str(bad), str(good)])
+                self.assertEqual(status, 1)
+                self.assertEqual(
+                    out,
+                    f"OK {good}: every packaged native library maps on 16 KB pages\n",
+                )
+                self.assertTrue(
+                    err.startswith(
+                        f"FAIL {bad}: could not read the artifact: "
+                        "base/lib/arm64-v8a/x.so: "
+                    ),
+                    err,
+                )
+
+    @staticmethod
+    def data_offset(raw: bytearray) -> int:
+        with zipfile.ZipFile(io.BytesIO(bytes(raw))) as archive:
+            info = archive.infolist()[0]
+            return zip_data_offset(io.BytesIO(bytes(raw)), info.header_offset)
+
+    @staticmethod
+    def set_header_field(
+        raw: bytearray, local_at: int, central_at: int, value: int
+    ) -> None:
+        """Set one 16-bit field in the first entry's central directory record,
+        where zipfile reads it, and in its local header, so the two agree as
+        they would in an archive written that way."""
+        for header, at in ((b"PK\x03\x04", local_at), (b"PK\x01\x02", central_at)):
+            struct.pack_into("<H", raw, raw.index(header) + at, value)
 
     def test_a_missing_artifact_is_a_failure_not_a_pass(self) -> None:
         status, out, err = run(["android-page-align", str(self.tmp / "absent.apk")])
