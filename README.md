@@ -124,11 +124,6 @@ installed:
   stream raise a traceback instead of printing a `FAIL` line. The exit status is
   still 1, but artifacts named after that one on the same command line are not
   checked.
-- **An ELF header whose byte-order field (`EI_DATA`) is neither
-  little-endian nor big-endian is not refused.** It is read as big-endian. A
-  little-endian library with that byte corrupted then fails as unreadable, but
-  a big-endian one is judged on its alignments instead of being reported. No
-  Android ABI is big-endian.
 
 ## License
 
