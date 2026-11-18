@@ -222,6 +222,21 @@ class TestElfFinding(unittest.TestCase):
         assert found is not None
         self.assertIn("unknown ELF class 3", found.reason)
 
+    def test_an_unknown_elf_data_encoding_fails_closed(self) -> None:
+        # The case a fallback byte order gets wrong: a big-endian header with
+        # good alignments but an invalid EI_DATA would read cleanly as
+        # big-endian and pass. 0 is ELFDATANONE; 3 is past the defined values.
+        for ei_data in (0, 3):
+            with self.subTest(ei_data=ei_data):
+                raw = bytearray(elf(endian=">"))
+                raw[5] = ei_data
+                found = elf_finding("lib.so", bytes(raw))
+                assert found is not None
+                self.assertEqual(
+                    found.reason,
+                    f"unreadable as ELF (unknown ELF data encoding {ei_data})",
+                )
+
     def test_a_short_program_header_stride_fails_closed(self) -> None:
         # The fail-OPEN direction, which is why this is a test and not a guard
         # taken on faith: a stride below the fields the parser reads still lands

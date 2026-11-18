@@ -75,6 +75,7 @@ PAGE_16K: Final = 16 * 1024
 ELFCLASS32: Final = 1
 ELFCLASS64: Final = 2
 ELFDATA2LSB: Final = 1
+ELFDATA2MSB: Final = 2
 PT_LOAD: Final = 1
 
 # `lib/<abi>/<name>.so` - the layout the loader maps out of an APK, as opposed to
@@ -114,7 +115,15 @@ def load_segment_alignments(elf: bytes) -> tuple[int, list[int]]:
         raise NotAnElf("not an ELF file")
 
     ei_class, ei_data = elf[4], elf[5]
-    endian = "<" if ei_data == ELFDATA2LSB else ">"
+    # Refused rather than defaulted: a byte order guessed for a header that
+    # names neither would have the alignments read in an order the file never
+    # claimed, and the result judged as if it were real.
+    if ei_data == ELFDATA2LSB:
+        endian = "<"
+    elif ei_data == ELFDATA2MSB:
+        endian = ">"
+    else:
+        raise NotAnElf(f"unknown ELF data encoding {ei_data}")
 
     if ei_class == ELFCLASS64:
         bits, ph_at, count_at, align_at, word = 64, 0x20, 0x36, 0x30, "Q"
